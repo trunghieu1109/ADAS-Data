@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import pickle
+import sys
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
@@ -11,9 +12,13 @@ import numpy as np
 import openai
 from tqdm import tqdm
 
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from model_api import create_openai_client, get_default_model, get_json_completion, get_last_completion_raw
+from run_logging import extract_reasoning, finish_query_logging, record_llm_invocation, start_query_logging, to_json_text, write_solution_run_outputs
+
 from arc_prompt import get_init_archive, get_prompt, get_reflexion_prompt
 
-client = openai.OpenAI()
+client = create_openai_client()
 
 from utils import random_id, format_arc_data, eval_solution, list_to_string, bootstrap_confidence_interval
 
@@ -33,18 +38,19 @@ def get_json_response_from_gpt(
         msg,
         model,
         system_message,
-        temperature=0.5
+        temperature=0.2
 ):
-    response = client.chat.completions.create(
+    json_dict = get_json_completion(
+        client=client,
         model=model,
         messages=[
             {"role": "system", "content": system_message},
             {"role": "user", "content": msg},
         ],
-        temperature=temperature, max_tokens=1024, stop=None, response_format={"type": "json_object"}
+        temperature=temperature,
+        max_tokens=4096,
+        stop=None,
     )
-    content = response.choices[0].message.content
-    json_dict = json.loads(content)
     # cost = response.usage.completion_tokens / 1000000 * 15 + response.usage.prompt_tokens / 1000000 * 5
     assert not json_dict is None
     return json_dict
@@ -56,13 +62,14 @@ def get_json_response_from_gpt_reflect(
         model,
         temperature=0.8
 ):
-    response = client.chat.completions.create(
+    json_dict = get_json_completion(
+        client=client,
         model=model,
         messages=msg_list,
-        temperature=temperature, max_tokens=4096, stop=None, response_format={"type": "json_object"}
+        temperature=temperature,
+        max_tokens=4096,
+        stop=None,
     )
-    content = response.choices[0].message.content
-    json_dict = json.loads(content)
     assert not json_dict is None
     return json_dict
 
@@ -73,7 +80,7 @@ class LLMAgentBase():
     """
 
     def __init__(self, output_fields: list, agent_name: str,
-                 role='helpful assistant', model='gpt-3.5-turbo-0125', temperature=0.5) -> None:
+                 role='helpful assistant', model=get_default_model(), temperature=0.2) -> None:
         self.output_fields = output_fields
         self.agent_name = agent_name
 
@@ -140,6 +147,12 @@ class LLMAgentBase():
             for key in copy.deepcopy(list(response_json.keys())):
                 if len(response_json) > len(self.output_fields) and not key in self.output_fields:
                     del response_json[key]
+        record_llm_invocation(
+            prompt=f"System:\n{system_prompt}\n\nUser:\n{prompt}",
+            invoker_name=self.agent_name,
+            output=get_last_completion_raw() or response_json,
+            reasoning=extract_reasoning(response_json),
+        )
         output_infos = []
         for key, value in response_json.items():
             info = Info(key, self.__repr__(), value, iteration_idx)
@@ -254,7 +267,7 @@ def search(args):
         solution['generation'] = "initial"
         print(f"============Initial Archive: {solution['name']}=================")
         try:
-            acc_list = evaluate_forward_fn(args, solution["code"])
+            acc_list = evaluate_forward_fn(args, solution["code"], run_name=solution["name"])
         except Exception as e:
             print("During evaluating initial archive:")
             print(e)
@@ -295,7 +308,7 @@ def search(args):
         acc_list = []
         for _ in range(args.debug_max):
             try:
-                acc_list = evaluate_forward_fn(args, next_solution["code"])
+                acc_list = evaluate_forward_fn(args, next_solution["code"], run_name=next_solution["name"])
                 if np.mean(acc_list) < 0.01 and SEARCHING_MODE:
                     raise Exception("All 0 accuracy")
                 break
@@ -350,7 +363,7 @@ def evaluate(args):
         sol = archive[current_idx]
         print(f"current_gen: {sol['generation']}, current_idx: {current_idx}")
         try:
-            acc_list = evaluate_forward_fn(args, sol["code"])
+            acc_list = evaluate_forward_fn(args, sol["code"], run_name=sol["name"])
         except Exception as e:
             print(e)
             continue
@@ -366,7 +379,7 @@ def evaluate(args):
         current_idx += 1
 
 
-def evaluate_forward_fn(args, forward_str):
+def evaluate_forward_fn(args, forward_str, run_name="archive"):
     # dynamically define forward()
     # modified from https://github.com/luchris429/DiscoPOP/blob/main/scripts/launch_evo.py
     namespace = {}
@@ -389,30 +402,58 @@ def evaluate_forward_fn(args, forward_str):
 
     print(f"problem length: {len(arc_data_queue) * args.n_repreat}")
     max_workers = min(len(arc_data_queue) * args.n_repreat, args.max_workers) if args.multiprocessing else 1
+    attempt_rows = {attempt_index: [] for attempt_index in range(1, args.n_repreat + 1)}
+    attempt_scores = {attempt_index: [] for attempt_index in range(1, args.n_repreat + 1)}
 
     agent_task_queue = []
-    for arc_data in arc_data_queue:
-        task_str, examples, test_input = format_arc_data(arc_data)
-        taskInfo = Info('task', 'User', task_str, -1)
-        agent_task_queue.extend([(AgentSystem(examples, test_input), taskInfo, arc_data)] * args.n_repreat)
+    for attempt_index in range(1, args.n_repreat + 1):
+        for arc_data in arc_data_queue:
+            task_str, examples, test_input = format_arc_data(arc_data)
+            taskInfo = Info('task', 'User', task_str, -1)
+            agent_task_queue.append((attempt_index, AgentSystem(examples, test_input), taskInfo, arc_data))
 
     def call_forward(agent_task_queue):
-        agent, taskInfo, arc_data = agent_task_queue
-        res = agent.forward(taskInfo)
-        origin_res = res
+        attempt_index, agent, taskInfo, arc_data = agent_task_queue
+        start_query_logging()
+        try:
+            res = agent.forward(taskInfo)
+        finally:
+            execution_logs = finish_query_logging()
+        normalized_output = res
         try:
             if isinstance(res, Info):
-                res = res.content
-            if isinstance(res, str):
-                res = eval(res)
-            hard_score = eval_solution(res, arc_data, soft_eval=False)
-            return hard_score
+                normalized_output = res.content
+            if isinstance(normalized_output, str):
+                normalized_output = eval(normalized_output)
+            hard_score = eval_solution(normalized_output, arc_data, soft_eval=False)
+            return attempt_index, hard_score, {
+                "task": taskInfo.content,
+                "code": forward_str,
+                "output": to_json_text(normalized_output),
+                "expected_output": to_json_text(arc_data['test'][0]['output']),
+                "score": hard_score,
+                "execution_logs": to_json_text(execution_logs),
+            }
         except Exception as e:
             # print(e)
-            return 0
+            return attempt_index, 0, {
+                "task": taskInfo.content,
+                "code": forward_str,
+                "output": to_json_text(res),
+                "expected_output": to_json_text(arc_data['test'][0]['output']),
+                "score": 0,
+                "execution_logs": to_json_text(execution_logs),
+            }
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        acc_list = list(tqdm(executor.map(call_forward, agent_task_queue), total=len(agent_task_queue)))
+        results = list(tqdm(executor.map(call_forward, agent_task_queue), total=len(agent_task_queue)))
+
+    acc_list = []
+    for attempt_index, score, row in results:
+        acc_list.append(score)
+        attempt_scores[attempt_index].append(score)
+        attempt_rows[attempt_index].append(row)
+    write_solution_run_outputs(os.path.dirname(__file__), args.expr_name, run_name, SEARCHING_MODE, "score", attempt_rows, attempt_scores)
 
     print("acc:", bootstrap_confidence_interval(acc_list))
     return acc_list
@@ -422,7 +463,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--val_data_path', type=str, default='sampled_arc_val_data.pkl')
     parser.add_argument('--test_data_path', type=str, default='sampled_arc_test_data.pkl')
-    parser.add_argument('--n_repreat', type=int, default=5)
+    parser.add_argument('--n_repreat', '--n_repeat', dest='n_repreat', type=int, default=5)
     parser.add_argument('--multiprocessing', action='store_true', default=True)
     parser.add_argument('--max_workers', type=int, default=32)
     parser.add_argument('--debug', action='store_true', default=True)
@@ -431,10 +472,10 @@ if __name__ == "__main__":
     parser.add_argument('--n_generation', type=int, default=25)
     parser.add_argument('--reflect_max', type=int, default=3)
     parser.add_argument('--debug_max', type=int, default=3)
+    parser.add_argument('--skip_evaluate', action='store_true', default=False)
     parser.add_argument('--model',
                         type=str,
-                        default='gpt-4o-2024-05-13',
-                        choices=['gpt-4-turbo-2024-04-09', 'gpt-3.5-turbo-0125', 'gpt-4o-2024-05-13'])
+                        default=get_default_model())
 
     args = parser.parse_args()
     # search
@@ -442,5 +483,6 @@ if __name__ == "__main__":
     search(args)
 
     # evaluate
-    SEARCHING_MODE = False
-    evaluate(args)
+    if not args.skip_evaluate:
+        SEARCHING_MODE = False
+        evaluate(args)

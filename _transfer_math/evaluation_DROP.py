@@ -5,6 +5,7 @@ import numpy as np
 import json
 import argparse
 import copy
+import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from tqdm import tqdm
 import pandas
@@ -13,7 +14,12 @@ import re
 
 import openai
 import backoff
-client = openai.OpenAI()
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from model_api import create_openai_client, get_default_model, get_json_completion, get_last_completion_raw
+from run_logging import extract_reasoning, finish_query_logging, record_llm_invocation, start_query_logging, to_json_text, write_solution_run_outputs
+
+client = create_openai_client()
 
 from DROP_utils import random_id, bootstrap_confidence_interval, load_drop, drop_metric
 Info = namedtuple('Info', ['name', 'author', 'content', 'iteration_idx'])
@@ -30,18 +36,19 @@ def get_json_response_from_gpt(
         msg,
         model,
         system_message,
-        temperature=0.5
+        temperature=0.2
 ):
-    response = client.chat.completions.create(
+    json_dict = get_json_completion(
+        client=client,
         model=model,
         messages=[
             {"role": "system", "content": system_message},
             {"role": "user", "content": msg},
         ],
-        temperature=temperature, max_tokens=4096, stop=None, response_format={"type": "json_object"}
+        temperature=temperature,
+        max_tokens=4096,
+        stop=None,
     )
-    content = response.choices[0].message.content
-    json_dict = json.loads(content, strict=False)
     # cost = response.usage.completion_tokens / 1000000 * 15 + response.usage.prompt_tokens / 1000000 * 5
     assert not json_dict is None
     return json_dict
@@ -52,13 +59,14 @@ def get_json_response_from_gpt_reflect(
         model,
         temperature=0.8
 ):
-    response = client.chat.completions.create(
+    json_dict = get_json_completion(
+        client=client,
         model=model,
         messages=msg_list,
-        temperature=temperature, max_tokens=4096, stop=None, response_format={"type": "json_object"}
+        temperature=temperature,
+        max_tokens=4096,
+        stop=None,
     )
-    content = response.choices[0].message.content
-    json_dict = json.loads(content)
     assert not json_dict is None
     return json_dict
 
@@ -68,7 +76,7 @@ class LLMAgentBase():
     """
 
     def __init__(self, output_fields: list, agent_name: str,
-                 role='helpful assistant', model='gpt-3.5-turbo-0125', temperature=0.5) -> None:
+                 role='helpful assistant', model=get_default_model(), temperature=0.2) -> None:
         self.output_fields = output_fields
         self.agent_name = agent_name
 
@@ -120,6 +128,12 @@ class LLMAgentBase():
             for key in copy.deepcopy(list(response_json.keys())):
                 if len(response_json) > len(self.output_fields) and not key in self.output_fields:
                     del response_json[key]
+        record_llm_invocation(
+            prompt=f"System:\n{system_prompt}\n\nUser:\n{prompt}",
+            invoker_name=self.agent_name,
+            output=get_last_completion_raw() or response_json,
+            reasoning=extract_reasoning(response_json),
+        )
         output_infos = []
         for key, value in response_json.items():
             info = Info(key, self.__repr__(), value, iteration_idx)
@@ -146,7 +160,7 @@ def evaluate(args):
 
     for sol in test_entries:
         print(f"{sol['name']}")
-        acc_list = evaluate_forward_fn(args, sol['code'])
+        acc_list = evaluate_forward_fn(args, sol['code'], run_name=sol['name'])
         sol['test_fitness_DROP'] = bootstrap_confidence_interval(acc_list)
 
     # Step 5: Save the test entries
@@ -154,7 +168,7 @@ def evaluate(args):
         json.dump(test_entries, json_file, indent=4)
 
 
-def evaluate_forward_fn(args, forward_str):
+def evaluate_forward_fn(args, forward_str, run_name="archive"):
     # dynamically define forward()
     # modified from https://github.com/luchris429/DiscoPOP/blob/main/scripts/launch_evo.py
     namespace = {}
@@ -173,9 +187,15 @@ def evaluate_forward_fn(args, forward_str):
     random.shuffle(examples)
 
     if SEARCHING_MODE:
-        examples = examples[:args.valid_size] * args.n_repreat
+        base_examples = examples[:args.valid_size]
     else:
-        examples = examples[args.valid_size:args.valid_size+args.test_size] * args.n_repreat
+        base_examples = examples[args.valid_size:args.valid_size+args.test_size]
+
+    examples = []
+    attempt_indices = []
+    for attempt_index in range(1, args.n_repreat + 1):
+        examples.extend(base_examples)
+        attempt_indices.extend([attempt_index] * len(base_examples))
 
     questions = [example['inputs'] for example in examples]
     answers = [example['targets'] for example in examples]
@@ -190,12 +210,26 @@ def evaluate_forward_fn(args, forward_str):
 
 
     agentSystem = AgentSystem()
+    run_group_name = os.path.splitext(os.path.basename(args.eval_file_path or args.data_filename))[0]
+    attempt_rows = {attempt_index: [] for attempt_index in range(1, args.n_repreat + 1)}
+    attempt_scores = {attempt_index: [] for attempt_index in range(1, args.n_repreat + 1)}
 
     acc_list = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = list(tqdm(executor.map(agentSystem.forward, task_queue), total=len(task_queue)))
 
-    for q_idx, res in enumerate(results):
+    def call_forward(task_info):
+        start_query_logging()
+        try:
+            result = agentSystem.forward(task_info)
+            return result, finish_query_logging()
+        except Exception:
+            execution_logs = finish_query_logging()
+            raise
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(tqdm(executor.map(call_forward, task_queue), total=len(task_queue)))
+
+    for q_idx, (res, execution_logs) in enumerate(results):
+        attempt_index = attempt_indices[q_idx]
         try:
             if isinstance(res, Info):
                 extracted_answer = res.content
@@ -204,10 +238,21 @@ def evaluate_forward_fn(args, forward_str):
             correct_answers = answers[q_idx]
             em_score, f1_score = drop_metric(extracted_answer, correct_answers)
         except Exception as e:
-            acc_list.append(0)
-            continue
+            extracted_answer = res
+            correct_answers = answers[q_idx]
+            f1_score = 0
 
         acc_list.append(f1_score)
+        attempt_scores[attempt_index].append(f1_score)
+        attempt_rows[attempt_index].append({
+            "task": task_queue[q_idx].content,
+            "code": forward_str,
+            "output": to_json_text(extracted_answer),
+            "expected_output": to_json_text(correct_answers),
+            "score": f1_score,
+            "execution_logs": to_json_text(execution_logs),
+        })
+    write_solution_run_outputs(os.path.dirname(__file__), run_group_name, run_name, SEARCHING_MODE, "f1", attempt_rows, attempt_scores)
     print(f"acc: {bootstrap_confidence_interval(acc_list)}")
     return acc_list
 
@@ -217,15 +262,14 @@ if __name__ == "__main__":
     parser.add_argument('--valid_size', type=int, default=128)
     parser.add_argument('--test_size', type=int, default=800)
     parser.add_argument('--shuffle_seed', type=int, default=0)
-    parser.add_argument('--n_repreat', type=int, default=1)
+    parser.add_argument('--n_repreat', '--n_repeat', dest='n_repreat', type=int, default=1)
     parser.add_argument('--multiprocessing', action='store_true', default=True)
     parser.add_argument('--max_workers', type=int, default=48)
     parser.add_argument('--debug', action='store_true', default=True)
     parser.add_argument('--eval_file_path', type=str, default='')
     parser.add_argument('--model',
                         type=str,
-                        default='gpt-4o-2024-05-13',
-                        choices=['gpt-4-turbo-2024-04-09', 'gpt-3.5-turbo-0125', 'gpt-4o-2024-05-13'])
+                        default=get_default_model())
 
     args = parser.parse_args()
 

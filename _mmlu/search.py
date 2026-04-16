@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import os
+import sys
 import random
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
@@ -12,9 +13,13 @@ import openai
 import pandas
 from tqdm import tqdm
 
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from model_api import create_openai_client, get_default_model, get_json_completion, get_last_completion_raw
+from run_logging import extract_reasoning, finish_query_logging, record_llm_invocation, start_query_logging, to_json_text, write_solution_run_outputs
+
 from mmlu_prompt import get_init_archive, get_prompt, get_reflexion_prompt
 
-client = openai.OpenAI()
+client = create_openai_client()
 
 from utils import format_multichoice_question, random_id, bootstrap_confidence_interval
 
@@ -33,18 +38,19 @@ def get_json_response_from_gpt(
         msg,
         model,
         system_message,
-        temperature=0.5
+        temperature=0.2
 ):
-    response = client.chat.completions.create(
+    json_dict = get_json_completion(
+        client=client,
         model=model,
         messages=[
             {"role": "system", "content": system_message},
             {"role": "user", "content": msg},
         ],
-        temperature=temperature, max_tokens=4096, stop=None, response_format={"type": "json_object"}
+        temperature=temperature,
+        max_tokens=4096,
+        stop=None,
     )
-    content = response.choices[0].message.content
-    json_dict = json.loads(content)
     # cost = response.usage.completion_tokens / 1000000 * 15 + response.usage.prompt_tokens / 1000000 * 5
     assert not json_dict is None
     return json_dict
@@ -56,13 +62,14 @@ def get_json_response_from_gpt_reflect(
         model,
         temperature=0.8
 ):
-    response = client.chat.completions.create(
+    json_dict = get_json_completion(
+        client=client,
         model=model,
         messages=msg_list,
-        temperature=temperature, max_tokens=4096, stop=None, response_format={"type": "json_object"}
+        temperature=temperature,
+        max_tokens=4096,
+        stop=None,
     )
-    content = response.choices[0].message.content
-    json_dict = json.loads(content)
     assert not json_dict is None
     return json_dict
 
@@ -73,7 +80,7 @@ class LLMAgentBase():
     """
 
     def __init__(self, output_fields: list, agent_name: str,
-                 role='helpful assistant', model='gpt-3.5-turbo-0125', temperature=0.5) -> None:
+                 role='helpful assistant', model=get_default_model(), temperature=0.2) -> None:
         self.output_fields = output_fields
         self.agent_name = agent_name
 
@@ -125,6 +132,12 @@ class LLMAgentBase():
             for key in copy.deepcopy(list(response_json.keys())):
                 if len(response_json) > len(self.output_fields) and not key in self.output_fields:
                     del response_json[key]
+        record_llm_invocation(
+            prompt=f"System:\n{system_prompt}\n\nUser:\n{prompt}",
+            invoker_name=self.agent_name,
+            output=get_last_completion_raw() or response_json,
+            reasoning=extract_reasoning(response_json),
+        )
         output_infos = []
         for key, value in response_json.items():
             info = Info(key, self.__repr__(), value, iteration_idx)
@@ -163,7 +176,7 @@ def search(args):
         solution['generation'] = "initial"
         print(f"============Initial Archive: {solution['name']}=================")
         try:
-            acc_list = evaluate_forward_fn(args, solution["code"])
+            acc_list = evaluate_forward_fn(args, solution["code"], run_name=solution["name"])
         except Exception as e:
             print("During evaluating initial archive:")
             print(e)
@@ -205,7 +218,7 @@ def search(args):
         acc_list = []
         for _ in range(args.debug_max):
             try:
-                acc_list = evaluate_forward_fn(args, next_solution["code"])
+                acc_list = evaluate_forward_fn(args, next_solution["code"], run_name=next_solution["name"])
                 if np.mean(acc_list) < 0.01 and SEARCHING_MODE:
                     raise Exception("All 0 accuracy")
                 break
@@ -262,7 +275,7 @@ def evaluate(args):
         print(f"current_gen: {sol['generation']}, current_idx: {current_idx}")
         current_idx += 1
         try:
-            acc_list = evaluate_forward_fn(args, sol["code"])
+            acc_list = evaluate_forward_fn(args, sol["code"], run_name=sol["name"])
         except Exception as e:
             print(e)
             continue
@@ -276,7 +289,7 @@ def evaluate(args):
             json.dump(eval_archive, json_file, indent=4)
 
 
-def evaluate_forward_fn(args, forward_str):
+def evaluate_forward_fn(args, forward_str, run_name="archive"):
     # dynamically define forward()
     # modified from https://github.com/luchris429/DiscoPOP/blob/main/scripts/launch_evo.py
     namespace = {}
@@ -297,9 +310,15 @@ def evaluate_forward_fn(args, forward_str):
     random.shuffle(examples)
 
     if SEARCHING_MODE:
-        examples = examples[:args.valid_size] * args.n_repreat
+        base_examples = examples[:args.valid_size]
     else:
-        examples = examples[args.valid_size:args.valid_size + args.test_size] * args.n_repreat
+        base_examples = examples[args.valid_size:args.valid_size + args.test_size]
+
+    examples = []
+    attempt_indices = []
+    for attempt_index in range(1, args.n_repreat + 1):
+        examples.extend(base_examples)
+        attempt_indices.extend([attempt_index] * len(base_examples))
 
     questions = [format_multichoice_question(example) for example in examples]
     answers = [LETTER_TO_INDEX[example['Answer']] for example in examples]
@@ -313,12 +332,27 @@ def evaluate_forward_fn(args, forward_str):
         task_queue.append(taskInfo)
 
     agentSystem = AgentSystem()
+    attempt_rows = {attempt_index: [] for attempt_index in range(1, args.n_repreat + 1)}
+    attempt_scores = {attempt_index: [] for attempt_index in range(1, args.n_repreat + 1)}
 
     acc_list = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = list(tqdm(executor.map(agentSystem.forward, task_queue), total=len(task_queue)))
 
-    for q_idx, res in enumerate(results):
+    def call_forward(task_info):
+        start_query_logging()
+        try:
+            result = agentSystem.forward(task_info)
+            return result, finish_query_logging()
+        except Exception:
+            execution_logs = finish_query_logging()
+            raise
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(tqdm(executor.map(call_forward, task_queue), total=len(task_queue)))
+
+    for q_idx, (res, execution_logs) in enumerate(results):
+        attempt_index = attempt_indices[q_idx]
+        score = 0
+        parse_error = None
         try:
             if isinstance(res, str) and res in LETTER_TO_INDEX:
                 predicted_idx = LETTER_TO_INDEX[res]
@@ -345,16 +379,35 @@ def evaluate_forward_fn(args, forward_str):
                 predicted_idx = 3
             else:
                 print(f"error in q {q_idx}")
-                acc_list.append(0)
-                continue
+                parse_error = "Could not map output to a valid MMLU answer choice."
+                predicted_idx = None
         except Exception as e:
-            acc_list.append(0)
-            continue
+            parse_error = str(e)
+            predicted_idx = None
 
-        if predicted_idx == answers[q_idx]:
-            acc_list.append(1)
-        else:
-            acc_list.append(0)
+        logged_output = res
+        if predicted_idx is None:
+            logged_output = {
+                "parser_status": "unrecognized_answer",
+                "raw_result": res,
+                "parse_error": parse_error,
+            }
+
+        if predicted_idx is not None and predicted_idx == answers[q_idx]:
+            score = 1
+        elif predicted_idx is not None:
+            score = 0
+        acc_list.append(score)
+        attempt_scores[attempt_index].append(score)
+        attempt_rows[attempt_index].append({
+            "task": task_queue[q_idx].content,
+            "code": forward_str,
+            "output": to_json_text(logged_output),
+            "expected_output": to_json_text(["A", "B", "C", "D"][answers[q_idx]]),
+            "score": score,
+            "execution_logs": to_json_text(execution_logs),
+        })
+    write_solution_run_outputs(os.path.dirname(__file__), args.expr_name, run_name, SEARCHING_MODE, "score", attempt_rows, attempt_scores)
     print(f"acc: {bootstrap_confidence_interval(acc_list)}")
     return acc_list
 
@@ -365,7 +418,7 @@ if __name__ == "__main__":
     parser.add_argument('--valid_size', type=int, default=128)
     parser.add_argument('--test_size', type=int, default=800)
     parser.add_argument('--shuffle_seed', type=int, default=0)
-    parser.add_argument('--n_repreat', type=int, default=1)
+    parser.add_argument('--n_repreat', '--n_repeat', dest='n_repreat', type=int, default=1)
     parser.add_argument('--multiprocessing', action='store_true', default=True)
     parser.add_argument('--max_workers', type=int, default=48)
     parser.add_argument('--debug', action='store_true', default=True)
@@ -373,10 +426,10 @@ if __name__ == "__main__":
     parser.add_argument('--expr_name', type=str, default="mmlu_gpt3.5_results")
     parser.add_argument('--n_generation', type=int, default=30)
     parser.add_argument('--debug_max', type=int, default=3)
+    parser.add_argument('--skip_evaluate', action='store_true', default=False)
     parser.add_argument('--model',
                         type=str,
-                        default='gpt-4o-2024-05-13',
-                        choices=['gpt-4-turbo-2024-04-09', 'gpt-3.5-turbo-0125', 'gpt-4o-2024-05-13'])
+                        default=get_default_model())
 
     args = parser.parse_args()
     # search
@@ -384,5 +437,6 @@ if __name__ == "__main__":
     search(args)
 
     # evaluate
-    SEARCHING_MODE = False
-    evaluate(args)
+    if not args.skip_evaluate:
+        SEARCHING_MODE = False
+        evaluate(args)

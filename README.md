@@ -34,8 +34,14 @@ conda create -n adas python=3.11
 conda activate adas
 pip install -r requirements.txt
 
-# provide your OpenAI API key
-export OPENAI_API_KEY="YOUR KEY HERE"
+# optional for OpenAI-compatible servers; a dummy value is fine for many local deployments
+export OPENAI_API_KEY="EMPTY"
+
+# optional; leave empty to use the provider default endpoint
+export OPENAI_BASE_URL=""
+
+# optional; defaults to GPT-OSS-20B in the patched scripts
+export OPENAI_MODEL="GPT-OSS-20B"
 ```
 
 ## Running Instructions
@@ -45,10 +51,16 @@ export OPENAI_API_KEY="YOUR KEY HERE"
 To run experiments for each domain, navigate to its respective folder. The code in each folder is self-contained. Launch experiments using the `search.py` script located in each domain's folder.
 
 ```bash
-python {DOMAIN}/search.py
+python {DOMAIN}/search.py --model GPT-OSS-20B
 ```
 
 Replace `{DOMAIN}` with the specific domain folder name {`_arc`, `_drop`, `_mgsm`, ...} to run the experiment for.
+
+Across the benchmark scripts, `--n_repeat` is now the standardized CLI flag for repeated benchmark attempts, with `--n_repreat` kept as a backward-compatible alias. The main search scripts also support `--skip_evaluate` if you want to run only the search phase and skip the final evaluation pass.
+
+The runtime now accepts any OpenAI-compatible chat-completions endpoint. If your open-source server does not support `response_format={"type": "json_object"}`, the code automatically retries without JSON mode and falls back to parsing the returned JSON text.
+
+Each benchmark now writes per-query execution records to a local `runs/` folder inside that benchmark directory. Outputs are grouped under `runs/<expr_name>/attempt_<k>/` for search scripts, or an equivalent run-name derived from the evaluation file for transfer evaluation scripts. Within each attempt directory, a new CSV file is created for each evaluated solution or archive entry rather than combining an entire run into a single CSV. The filename includes the archive name, a timestamp, and the aggregate benchmark result for that evaluated solution. Each CSV contains the evaluated task, the generated code being executed, the output returned by that code, the expected output, the per-query score, and the serialized execution logs for all LLM invocations made by the agent while solving that query.
 
 ### Customizing Meta Agent Search for New Domains
 
