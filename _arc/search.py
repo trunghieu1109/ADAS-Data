@@ -31,6 +31,25 @@ CODE_INST = "You will write code to solve this task by creating a function named
 
 PRINT_LLM_DEBUG = False
 SEARCHING_MODE = True
+MAX_ERROR_HISTORY = 5
+MAX_FAILURE_MEMORY = 3
+
+POSTPROCESS_SOLUTION_PROMPT = """You are post-processing a candidate agent architecture so it can run inside a Python benchmark runtime.
+
+Return a valid JSON object only.
+
+Requirements:
+1. Preserve the same overall algorithmic idea unless it is obviously malformed.
+2. Ensure the JSON object contains at least the keys 'thought', 'name', and 'code'. Keep optional keys like 'debug_thought' or 'reflection' only if they are already present and still useful.
+3. The 'code' field must be complete runnable Python code for a function named forward(self, taskInfo).
+4. The code must define exactly one top-level callable named forward. Do not define any additional top-level functions, classes, lambdas, or helper aliases.
+5. Put any imports, helper functions, constants, or utilities inside forward so exec(...) leaves only the symbol forward in the local namespace.
+6. The code will be executed directly inside Python. Fix any issues that would make it fail at runtime.
+7. Do not assume LLM outputs are always raw strings. If the code parses agent outputs, make it robust to already-parsed Python values such as dict, list, bool, or strings.
+8. If the code uses json.loads, only do so after checking that the value is an instance of str, bytes, or bytearray. Otherwise use the value directly.
+9. Do not add print statements, tests, markdown fences, or explanations outside the JSON object.
+
+Your goal is not just to make the JSON valid. Your goal is to make the returned Python code runnable in this benchmark runtime."""
 
 
 @backoff.on_exception(backoff.expo, openai.RateLimitError)
@@ -38,7 +57,7 @@ def get_json_response_from_gpt(
         msg,
         model,
         system_message,
-        temperature=0.2
+        temperature=0.1
 ):
     json_dict = get_json_completion(
         client=client,
@@ -48,7 +67,7 @@ def get_json_response_from_gpt(
             {"role": "user", "content": msg},
         ],
         temperature=temperature,
-        max_tokens=4096,
+        max_tokens=8192,
         stop=None,
     )
     # cost = response.usage.completion_tokens / 1000000 * 15 + response.usage.prompt_tokens / 1000000 * 5
@@ -67,7 +86,7 @@ def get_json_response_from_gpt_reflect(
         model=model,
         messages=msg_list,
         temperature=temperature,
-        max_tokens=4096,
+        max_tokens=8192,
         stop=None,
     )
     assert not json_dict is None
@@ -80,7 +99,7 @@ class LLMAgentBase():
     """
 
     def __init__(self, output_fields: list, agent_name: str,
-                 role='helpful assistant', model=get_default_model(), temperature=0.2) -> None:
+                 role='helpful assistant', model=get_default_model(), temperature=0.1) -> None:
         self.output_fields = output_fields
         self.agent_name = agent_name
 
@@ -247,6 +266,124 @@ class AgentSystem():
         return gen_output(transform_output)
 
 
+def _normalize_error_text(error_text):
+    normalized_text = " ".join(str(error_text).strip().split())
+    return normalized_text[:300]
+
+
+def _get_error_fingerprint(error):
+    error_type = type(error).__name__
+    error_text = _normalize_error_text(error)
+    return f"{error_type}:{error_text.lower()}"
+
+
+def _build_error_entry(error, attempt_idx, error_history):
+    error_type = type(error).__name__
+    error_text = _normalize_error_text(error)
+    fingerprint = _get_error_fingerprint(error)
+    repeated_count = sum(entry["fingerprint"] == fingerprint for entry in error_history) + 1
+    return {
+        "attempt": attempt_idx + 1,
+        "error_type": error_type,
+        "error_text": error_text,
+        "fingerprint": fingerprint,
+        "is_repeated": repeated_count > 1,
+        "repeat_count": repeated_count,
+    }
+
+
+def _format_error_history(error_history):
+    if not error_history:
+        return "No previous debug failures."
+
+    formatted_entries = []
+    for entry in error_history[-MAX_ERROR_HISTORY:]:
+        repeated_suffix = ""
+        if entry["is_repeated"]:
+            repeated_suffix = f" (repeated failure x{entry['repeat_count']})"
+        formatted_entries.append(
+            f"Attempt {entry['attempt']}: {entry['error_type']}: {entry['error_text']}{repeated_suffix}"
+        )
+    return "\n".join(formatted_entries)
+
+
+def _format_failure_memory(recent_failure_summaries):
+    if not recent_failure_summaries:
+        return ""
+
+    summary_lines = ["Recent failed generations to avoid repeating:"]
+    for summary in recent_failure_summaries[-MAX_FAILURE_MEMORY:]:
+        summary_lines.append(f"- {summary}")
+    return "\n".join(summary_lines)
+
+
+def _summarize_generation_failure(generation_idx, solution_name, error_history):
+    if not error_history:
+        return f"Generation {generation_idx} candidate {solution_name} failed without a captured evaluation error."
+
+    latest_error = error_history[-1]
+    repeated_failures = [entry for entry in error_history if entry["is_repeated"]]
+    repeated_suffix = ""
+    if repeated_failures:
+        repeated_suffix = f" Repeated pattern: {repeated_failures[-1]['error_type']}: {repeated_failures[-1]['error_text']}."
+    return (
+        f"Generation {generation_idx} candidate {solution_name} failed after {len(error_history)} debug attempts. "
+        f"Last error: {latest_error['error_type']}: {latest_error['error_text']}.{repeated_suffix}"
+    )
+
+
+def _postprocess_generated_solution(solution, model):
+    repair_messages = [
+        {"role": "system", "content": POSTPROCESS_SOLUTION_PROMPT},
+        {"role": "user", "content": to_json_text(solution)},
+    ]
+    return _get_json_response_with_retries(repair_messages, model, temperature=0.2)
+
+
+def _is_json_parse_error(error):
+    if isinstance(error, (json.JSONDecodeError, SyntaxError)):
+        return True
+
+    error_text = str(error).lower()
+    return any(token in error_text for token in [
+        "model returned an empty response",
+        "empty response",
+        "unterminated string",
+        "expecting value",
+        "invalid control character",
+        "failed to parse model response as json",
+        "json",
+    ])
+
+
+def _get_json_response_with_retries(msg_list, model, temperature=0.1, max_attempts=5):
+    current_messages = list(msg_list)
+    last_error = None
+
+    for attempt_idx in range(max_attempts):
+        try:
+            return get_json_response_from_gpt_reflect(current_messages, model, temperature=temperature)
+        except Exception as error:
+            last_error = error
+            if not _is_json_parse_error(error) or attempt_idx == max_attempts - 1:
+                raise
+
+            current_messages = current_messages + [{
+                "role": "user",
+                "content": (
+                    f"Your previous reply could not be parsed as valid JSON ({_normalize_error_text(error)}).\n"
+                    "Return a single valid JSON object only.\n"
+                    "Keep reasoning extremely brief and do not spend tokens on hidden or visible step-by-step analysis.\n"
+                    "Do not include long explanations or extra prose.\n"
+                    "Do not use markdown fences.\n"
+                    "Do not leave any string unterminated.\n"
+                    "Preserve the same intended fields and overall solution content."
+                ),
+            }]
+
+    raise last_error
+
+
 def search(args):
     file_path = os.path.join(args.save_dir, f"{args.expr_name}_run_archive.json")
     if os.path.exists(file_path):
@@ -281,6 +418,8 @@ def search(args):
         with open(file_path, 'w') as json_file:
             json.dump(archive, json_file, indent=4)
 
+    recent_failure_summaries = []
+
     for n in range(start, args.n_generation):
         print(f"============Generation {n + 1}=================")
         system_prompt, prompt = get_prompt(archive)
@@ -288,25 +427,30 @@ def search(args):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
+        failure_memory_text = _format_failure_memory(recent_failure_summaries)
+        if failure_memory_text:
+            msg_list.append({"role": "user", "content": failure_memory_text})
         try:
-            next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
+            next_solution = _get_json_response_with_retries(msg_list, args.model)
 
             Reflexion_prompt_1, Reflexion_prompt_2 = get_reflexion_prompt(archive[-1] if n > 0 else None)
             # Reflexion 1
-            msg_list.append({"role": "assistant", "content": str(next_solution)})
+            msg_list.append({"role": "assistant", "content": to_json_text(next_solution)})
             msg_list.append({"role": "user", "content": Reflexion_prompt_1})
-            next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
+            next_solution = _get_json_response_with_retries(msg_list, args.model)
             # Reflexion 2
-            msg_list.append({"role": "assistant", "content": str(next_solution)})
+            msg_list.append({"role": "assistant", "content": to_json_text(next_solution)})
             msg_list.append({"role": "user", "content": Reflexion_prompt_2})
-            next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
+            next_solution = _get_json_response_with_retries(msg_list, args.model)
+            next_solution = _postprocess_generated_solution(next_solution, args.model)
         except Exception as e:
             print("During LLM generate new solution:")
             print(e)
             continue
 
         acc_list = []
-        for _ in range(args.debug_max):
+        error_history = []
+        for debug_idx in range(args.debug_max):
             try:
                 acc_list = evaluate_forward_fn(args, next_solution["code"], run_name=next_solution["name"])
                 if np.mean(acc_list) < 0.01 and SEARCHING_MODE:
@@ -315,17 +459,42 @@ def search(args):
             except Exception as e:
                 print("During evaluation:")
                 print(e)
-                msg_list.append({"role": "assistant", "content": str(next_solution)})
-                msg_list.append({"role": "user", "content": f"Error during evaluation:\n{e}\nCarefully consider where you went wrong in your latest implementation. Using insights from previous attempts, try to debug the current code to implement the same thought. Repeat your previous thought in 'thought', and put your thinking for debugging in 'debug_thought'"})
+                error_entry = _build_error_entry(e, debug_idx, error_history)
+                error_history.append(error_entry)
+                error_history_text = _format_error_history(error_history)
+                repeated_failure_text = ""
+                if error_entry["is_repeated"]:
+                    repeated_failure_text = (
+                        f"\nRepeated failure detected for fingerprint {error_entry['fingerprint']}. "
+                        "Your previous fix did not resolve the root cause."
+                    )
+                msg_list.append({"role": "assistant", "content": to_json_text(next_solution)})
+                msg_list.append({"role": "user", "content": (
+                    f"Error during evaluation:\n{error_entry['error_type']}: {error_entry['error_text']}\n\n"
+                    f"Failure history for this generation:\n{error_history_text}{repeated_failure_text}\n\n"
+                    "Carefully consider where you went wrong in your latest implementation. "
+                    "Using insights from the failure history above, try to debug the current code to implement the same thought. "
+                    "If a failure pattern is repeated, explicitly identify the root cause and change strategy instead of repeating the same fix. "
+                    "The benchmark runtime expects exactly one top-level callable named forward; move all imports and helper logic inside forward and do not define any other top-level names. "
+                    "Repeat your previous thought in 'thought', and put your thinking for debugging in 'debug_thought'."
+                )})
                 try:
-                    next_solution = get_json_response_from_gpt_reflect(msg_list, args.model)
+                    next_solution = _get_json_response_with_retries(msg_list, args.model)
+                    next_solution = _postprocess_generated_solution(next_solution, args.model)
                 except Exception as e:
                     print("During LLM generate new solution:")
                     print(e)
                     continue
                 continue
         if not acc_list:
+            recent_failure_summaries.append(
+                _summarize_generation_failure(n + 1, next_solution.get("name", "unknown"), error_history)
+            )
+            recent_failure_summaries = recent_failure_summaries[-MAX_FAILURE_MEMORY:]
             continue
+
+        if error_history:
+            recent_failure_summaries = []
 
         fitness_str = bootstrap_confidence_interval(acc_list)
         next_solution['fitness'] = fitness_str

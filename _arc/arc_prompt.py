@@ -255,7 +255,7 @@ def ROLE_DESC(role):
 CODE_INST = \"""You should write a function called `transform` which takes a single argument, the input grid as `list[list[int]]`, and returns the transformed grid (also as `list[list[int]]`). You should ensure that you implement a version of the transformation that works for both example and test inputs.\"""
 
 @backoff.on_exception(backoff.expo, openai.RateLimitError)
-def get_json_response_from_gpt(msg, model, system_message, temperature=0.2):
+def get_json_response_from_gpt(msg, model, system_message, temperature=0.1):
     \"""
     Function to get JSON response from GPT model.
 
@@ -296,7 +296,7 @@ class LLMAgentBase:
     - id (str): Unique identifier for the agent instance.
     \"""
 
-    def __init__(self, output_fields: list, agent_name: str, role='helpful assistant', model='gpt-3.5-turbo-0125', temperature=0.2) -> None:
+    def __init__(self, output_fields: list, agent_name: str, role='helpful assistant', model='gpt-3.5-turbo-0125', temperature=0.1) -> None:
         self.output_fields = output_fields
         self.agent_name = agent_name
         self.role = role

@@ -70,11 +70,32 @@ def get_lang_examples(lang: str) -> list[dict[str, str]]:
     return examples
 
 
-def get_all_examples() -> list[dict[str, str]]:
+def normalize_languages(languages=None) -> list[str]:
+    if languages is None:
+        return list(ALL_LANGUAGES)
+
+    normalized_languages = []
+    for lang in languages:
+        normalized_lang = lang.strip().lower()
+        if not normalized_lang:
+            continue
+        if normalized_lang not in ALL_LANGUAGES:
+            raise ValueError(
+                f"Unsupported MGSM language '{lang}'. Supported languages: {', '.join(ALL_LANGUAGES)}"
+            )
+        if normalized_lang not in normalized_languages:
+            normalized_languages.append(normalized_lang)
+
+    if not normalized_languages:
+        raise ValueError("No valid MGSM languages were provided.")
+
+    return normalized_languages
+
+
+def get_all_examples(languages=None) -> list[dict[str, str]]:
+    selected_languages = normalize_languages(languages)
     examples = []
-    for lang in ALL_LANGUAGES:
-        # if lang != "en":
-        #     continue
+    for lang in selected_languages:
         examples += get_lang_examples(lang)
     return examples
 

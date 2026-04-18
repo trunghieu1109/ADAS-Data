@@ -1,5 +1,7 @@
+import ast
 import json
 import os
+import re
 import threading
 
 import openai
@@ -108,23 +110,143 @@ def _extract_json_object(content):
     if not content:
         raise ValueError("Model returned an empty response.")
 
-    try:
-        return json.loads(content, strict=False)
-    except json.JSONDecodeError:
-        stripped_content = content.strip()
+    def strip_code_fences(text):
+        stripped_text = text.strip()
+        if not stripped_text.startswith("```"):
+            return stripped_text
 
-        if stripped_content.startswith("```"):
-            for block in stripped_content.split("```"):
-                candidate = block.strip()
-                if candidate.startswith("json"):
-                    candidate = candidate[4:].strip()
-                if candidate.startswith("{") and candidate.endswith("}"):
-                    return json.loads(candidate, strict=False)
+        for block in stripped_text.split("```"):
+            candidate = block.strip()
+            if not candidate:
+                continue
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+            if candidate:
+                return candidate
+        return stripped_text
+
+    def remove_trailing_commas(text):
+        previous = None
+        current = text
+        while previous != current:
+            previous = current
+            current = re.sub(r",\s*([}\]])", r"\1", current)
+        return current
+
+    def escape_control_chars_in_strings(text):
+        escaped_chars = []
+        inside_string = False
+        escape_next = False
+
+        for char in text:
+            if inside_string:
+                if escape_next:
+                    escaped_chars.append(char)
+                    escape_next = False
+                    continue
+                if char == "\\":
+                    escaped_chars.append(char)
+                    escape_next = True
+                    continue
+                if char == '"':
+                    escaped_chars.append(char)
+                    inside_string = False
+                    continue
+                if char == "\n":
+                    escaped_chars.append("\\n")
+                    continue
+                if char == "\r":
+                    escaped_chars.append("\\r")
+                    continue
+                if char == "\t":
+                    escaped_chars.append("\\t")
+                    continue
+            else:
+                if char == '"':
+                    inside_string = True
+            escaped_chars.append(char)
+
+        return "".join(escaped_chars)
+
+    def extract_balanced_json_substring(text):
+        start_idx = -1
+        stack = []
+        inside_string = False
+        escape_next = False
+
+        for idx, char in enumerate(text):
+            if start_idx == -1:
+                if char in "{[":
+                    start_idx = idx
+                    stack.append("}" if char == "{" else "]")
+                continue
+
+            if inside_string:
+                if escape_next:
+                    escape_next = False
+                elif char == "\\":
+                    escape_next = True
+                elif char == '"':
+                    inside_string = False
+                continue
+
+            if char == '"':
+                inside_string = True
+            elif char in "{[":
+                stack.append("}" if char == "{" else "]")
+            elif char in "}]":
+                if not stack or char != stack[-1]:
+                    break
+                stack.pop()
+                if not stack:
+                    return text[start_idx:idx + 1]
+
+        return None
+
+    def parse_candidate(candidate):
+        stripped_candidate = candidate.strip()
+        try:
+            return json.loads(candidate, strict=False)
+        except json.JSONDecodeError:
+            if not ((stripped_candidate.startswith("{") and stripped_candidate.endswith("}"))
+                    or (stripped_candidate.startswith("[") and stripped_candidate.endswith("]"))):
+                raise
+
+            normalized_candidate = (stripped_candidate
+                                    .replace("\u2011", "-")
+                                    .replace("\u2013", "-")
+                                    .replace("\u2014", "-"))
+            try:
+                parsed_python_literal = ast.literal_eval(normalized_candidate)
+                if isinstance(parsed_python_literal, (dict, list)):
+                    return parsed_python_literal
+            except (SyntaxError, ValueError):
+                pass
+        sanitized_candidate = (stripped_candidate
+                               .replace("\u2011", "-")
+                               .replace("\u2013", "-")
+                               .replace("\u2014", "-")
+                               .replace("\u201c", '"')
+                               .replace("\u201d", '"')
+                               .replace("\u2018", "'")
+                               .replace("\u2019", "'")
+                               .replace("\x00", ""))
+        sanitized_candidate = escape_control_chars_in_strings(sanitized_candidate)
+        sanitized_candidate = remove_trailing_commas(sanitized_candidate)
+        return json.loads(sanitized_candidate, strict=False)
+
+    try:
+        return parse_candidate(strip_code_fences(content))
+    except (json.JSONDecodeError, SyntaxError, ValueError):
+        stripped_content = strip_code_fences(content)
+        balanced_candidate = extract_balanced_json_substring(stripped_content)
+        if balanced_candidate:
+            return parse_candidate(balanced_candidate)
 
         start_idx = stripped_content.find("{")
         end_idx = stripped_content.rfind("}")
         if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-            return json.loads(stripped_content[start_idx:end_idx + 1], strict=False)
+            return parse_candidate(stripped_content[start_idx:end_idx + 1])
 
         raise
 
@@ -161,7 +283,7 @@ def _create_chat_completion(client, request_kwargs, use_json_mode=True, use_reas
     return client.chat.completions.create(**completion_kwargs)
 
 
-def get_json_completion(client, model, messages, temperature=0.2, max_tokens=4096, stop=None):
+def get_json_completion(client, model, messages, temperature=0.1, max_tokens=8192, stop=None):
     _set_last_completion_raw("")
     _set_last_completion_error("")
     _set_last_completion_reasoning("")
@@ -190,7 +312,15 @@ def get_json_completion(client, model, messages, temperature=0.2, max_tokens=409
                 use_json_mode=use_json_mode,
                 use_reasoning_effort=use_reasoning_effort,
             )
-            break
+            _set_last_completion_raw(_serialize_response(response))
+            _set_last_completion_reasoning(_extract_message_reasoning(response))
+
+            content = _extract_message_content(response)
+            try:
+                return _extract_json_object(content)
+            except Exception as exc:
+                last_error = exc
+                continue
         except Exception as exc:
             last_error = exc
             is_reasoning_error = _supports_reasoning_effort_error(exc)
@@ -213,11 +343,5 @@ def get_json_completion(client, model, messages, temperature=0.2, max_tokens=409
         _set_last_completion_error(str(last_error) if last_error else "Unknown completion error")
         raise RuntimeError("Failed to create chat completion response.")
 
-    _set_last_completion_raw(_serialize_response(response))
-    _set_last_completion_reasoning(_extract_message_reasoning(response))
-    content = _extract_message_content(response)
-    try:
-        return _extract_json_object(content)
-    except Exception as exc:
-        _set_last_completion_error(str(exc))
-        raise
+    _set_last_completion_error(str(last_error) if last_error else "Failed to parse model response as JSON.")
+    raise last_error if last_error else RuntimeError("Failed to parse model response as JSON.")

@@ -33,7 +33,7 @@ def get_json_response_from_gpt(
         msg,
         model,
         system_message,
-        temperature=0.2
+        temperature=0.1
 ):
     json_dict = get_json_completion(
         client=client,
@@ -43,7 +43,7 @@ def get_json_response_from_gpt(
             {"role": "user", "content": msg},
         ],
         temperature=temperature,
-        max_tokens=4096,
+        max_tokens=8192,
         stop=None,
     )
     # cost = response.usage.completion_tokens / 1000000 * 15 + response.usage.prompt_tokens / 1000000 * 5
@@ -62,7 +62,7 @@ def get_json_response_from_gpt_reflect(
         model=model,
         messages=msg_list,
         temperature=temperature,
-        max_tokens=4096,
+        max_tokens=8192,
         stop=None,
     )
     assert not json_dict is None
@@ -75,7 +75,7 @@ class LLMAgentBase():
     """
 
     def __init__(self, output_fields: list, agent_name: str,
-                 role='helpful assistant', model=get_default_model(), temperature=0.2) -> None:
+                 role='helpful assistant', model=get_default_model(), temperature=0.1) -> None:
         self.output_fields = output_fields
         self.agent_name = agent_name
 

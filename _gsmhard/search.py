@@ -2,26 +2,25 @@ import argparse
 import copy
 import json
 import os
-import sys
 import random
+import sys
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
 import backoff
 import numpy as np
 import openai
-import pandas
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from model_api import create_openai_client, get_default_model, get_json_completion, get_last_completion_raw
+from model_api import create_openai_client, get_default_model, get_json_completion, get_last_completion_error, get_last_completion_raw
 from run_logging import extract_reasoning, finish_query_logging, record_llm_invocation, start_query_logging, to_json_text, write_solution_run_outputs
 
-from mmlu_prompt import get_init_archive, get_prompt, get_reflexion_prompt
+from gsmhard_prompt import get_init_archive, get_prompt, get_reflexion_prompt
 
 client = create_openai_client()
 
-from utils import format_multichoice_question, random_id, bootstrap_confidence_interval
+from utils import get_all_examples, random_id, bootstrap_confidence_interval, score_gsmhard
 
 Info = namedtuple('Info', ['name', 'author', 'content', 'iteration_idx'])
 
@@ -29,7 +28,7 @@ FORMAT_INST = lambda request_keys: f"""Reply EXACTLY with the following JSON for
 ROLE_DESC = lambda role: f"You are a {role}."
 SYSTEM_MSG = ""
 
-PRINT_LLM_DEBUG = False
+PRINT_LLM_DEBUG = os.getenv("ADAS_PRINT_LLM_DEBUG", "0") == "1"
 SEARCHING_MODE = True
 MAX_ERROR_HISTORY = 5
 MAX_FAILURE_MEMORY = 3
@@ -70,8 +69,7 @@ def get_json_response_from_gpt(
         max_tokens=8192,
         stop=None,
     )
-    # cost = response.usage.completion_tokens / 1000000 * 15 + response.usage.prompt_tokens / 1000000 * 5
-    assert not json_dict is None
+    assert json_dict is not None
     return json_dict
 
 
@@ -79,7 +77,7 @@ def get_json_response_from_gpt(
 def get_json_response_from_gpt_reflect(
         msg_list,
         model,
-        temperature=0.8
+        temperature=0.1
 ):
     json_dict = get_json_completion(
         client=client,
@@ -89,15 +87,11 @@ def get_json_response_from_gpt_reflect(
         max_tokens=8192,
         stop=None,
     )
-    assert not json_dict is None
+    assert json_dict is not None
     return json_dict
 
 
 class LLMAgentBase():
-    """
-    Attributes:
-    """
-
     def __init__(self, output_fields: list, agent_name: str,
                  role='helpful assistant', model=get_default_model(), temperature=0.1) -> None:
         self.output_fields = output_fields
@@ -107,15 +101,15 @@ class LLMAgentBase():
         self.model = model
         self.temperature = temperature
 
-        # give each instance a unique id
         self.id = random_id()
 
     def generate_prompt(self, input_infos, instruction) -> str:
-        # construct system prompt
-        output_fields_and_description = {key: f"Your {key}." if not 'answer' in key else f"Your {key}. Return ONLY the alphabet choice, i.e. A or B or C or D." for key in self.output_fields}
+        output_fields_and_description = {
+            key: f"Your {key}." if 'answer' not in key else f"Your {key}. Return ONLY an integer. DO NOT return anything other than the integer answer."
+            for key in self.output_fields
+        }
         system_prompt = ROLE_DESC(self.role) + "\n\n" + FORMAT_INST(output_fields_and_description)
 
-        # construct input infos text
         input_infos_text = ''
         for input_info in input_infos:
             if isinstance(input_info, Info):
@@ -136,26 +130,37 @@ class LLMAgentBase():
 
     def query(self, input_infos: list, instruction, iteration_idx=-1) -> dict:
         system_prompt, prompt = self.generate_prompt(input_infos, instruction)
+        response_json = {}
+        llm_error = ""
         try:
-            response_json = {}
             response_json = get_json_response_from_gpt(prompt, self.model, system_prompt, self.temperature)
             assert len(response_json) == len(self.output_fields), "not returning enough fields"
-        except Exception as e:
-            # print(e)
-            if "maximum context length" in str(e) and SEARCHING_MODE:
+        except Exception as error:
+            llm_error = str(error)
+            if "maximum context length" in str(error) and SEARCHING_MODE:
                 raise AssertionError("The context is too long. Please try to design the agent to have shorter context.")
-            # try to fill in the missing field
             for key in self.output_fields:
-                if not key in response_json and len(response_json) < len(self.output_fields):
+                if key not in response_json and len(response_json) < len(self.output_fields):
                     response_json[key] = ''
             for key in copy.deepcopy(list(response_json.keys())):
-                if len(response_json) > len(self.output_fields) and not key in self.output_fields:
+                if len(response_json) > len(self.output_fields) and key not in self.output_fields:
                     del response_json[key]
+            if PRINT_LLM_DEBUG:
+                print(f"[LLM DEBUG] {self.agent_name} failed: {llm_error}")
+                print(f"[LLM DEBUG] Raw response: {get_last_completion_raw()!r}")
         record_llm_invocation(
             prompt=f"System:\n{system_prompt}\n\nUser:\n{prompt}",
             invoker_name=self.agent_name,
-            output=get_last_completion_raw() or response_json,
+            output={
+                "raw_response": get_last_completion_raw(),
+                "parsed_response": response_json,
+            },
             reasoning=extract_reasoning(response_json),
+            debug_info={
+                "error": get_last_completion_error() or llm_error,
+                "temperature": self.temperature,
+                "model": self.model,
+            },
         )
         output_infos = []
         for key, value in response_json.items():
@@ -298,8 +303,8 @@ def search(args):
     if os.path.exists(file_path):
         with open(file_path, 'r') as json_file:
             archive = json.load(json_file)
-        if "generation" in archive[-1] and isinstance(archive[-1]['generation'], int):
-            start = archive[-1]['generation']
+        if "generation" in archive[-1] and isinstance(archive[-1]["generation"], int):
+            start = archive[-1]["generation"]
         else:
             start = 0
     else:
@@ -314,23 +319,21 @@ def search(args):
         print(f"============Initial Archive: {solution['name']}=================")
         try:
             acc_list = evaluate_forward_fn(args, solution["code"], run_name=solution["name"])
-        except Exception as e:
+        except Exception as error:
             print("During evaluating initial archive:")
-            print(e)
+            print(error)
             continue
 
-        fitness_str = bootstrap_confidence_interval(acc_list)
-        solution['fitness'] = fitness_str
+        solution['fitness'] = bootstrap_confidence_interval(acc_list)
 
-        # save results
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, 'w') as json_file:
             json.dump(archive, json_file, indent=4)
 
     recent_failure_summaries = []
 
-    for n in range(start, args.n_generation):
-        print(f"============Generation {n + 1}=================")
+    for generation_idx in range(start, args.n_generation):
+        print(f"============Generation {generation_idx + 1}=================")
         system_prompt, prompt = get_prompt(archive)
         msg_list = [
             {"role": "system", "content": system_prompt},
@@ -342,20 +345,18 @@ def search(args):
         try:
             next_solution = _get_json_response_with_retries(msg_list, args.model)
 
-            Reflexion_prompt_1, Reflexion_prompt_2 = get_reflexion_prompt(archive[-1] if n > 0 else None)
-            # Reflexion 1
+            reflexion_prompt_1, reflexion_prompt_2 = get_reflexion_prompt(archive[-1] if generation_idx > 0 else None)
             msg_list.append({"role": "assistant", "content": to_json_text(next_solution)})
-            msg_list.append({"role": "user", "content": Reflexion_prompt_1})
+            msg_list.append({"role": "user", "content": reflexion_prompt_1})
             next_solution = _get_json_response_with_retries(msg_list, args.model)
-            # Reflexion 2
+
             msg_list.append({"role": "assistant", "content": to_json_text(next_solution)})
-            msg_list.append({"role": "user", "content": Reflexion_prompt_2})
+            msg_list.append({"role": "user", "content": reflexion_prompt_2})
             next_solution = _get_json_response_with_retries(msg_list, args.model)
             next_solution = _postprocess_generated_solution(next_solution, args.model)
-        except Exception as e:
+        except Exception as error:
             print("During LLM generate new solution:")
-            print(e)
-            n -= 1
+            print(error)
             continue
 
         acc_list = []
@@ -366,10 +367,10 @@ def search(args):
                 if np.mean(acc_list) < 0.01 and SEARCHING_MODE:
                     raise Exception("All 0 accuracy")
                 break
-            except Exception as e:
+            except Exception as error:
                 print("During evaluation:")
-                print(e)
-                error_entry = _build_error_entry(e, debug_idx, error_history)
+                print(error)
+                error_entry = _build_error_entry(error, debug_idx, error_history)
                 error_history.append(error_entry)
                 error_history_text = _format_error_history(error_history)
                 repeated_failure_text = ""
@@ -379,37 +380,37 @@ def search(args):
                         "Your previous fix did not resolve the root cause."
                     )
                 msg_list.append({"role": "assistant", "content": to_json_text(next_solution)})
-                msg_list.append({"role": "user", "content": (
-                    f"Error during evaluation:\n{error_entry['error_type']}: {error_entry['error_text']}\n\n"
-                    f"Failure history for this generation:\n{error_history_text}{repeated_failure_text}\n\n"
-                    "Carefully consider where you went wrong in your latest implementation. "
-                    "Using insights from the failure history above, try to debug the current code to implement the same thought. "
-                    "If a failure pattern is repeated, explicitly identify the root cause and change strategy instead of repeating the same fix. "
-                    "The benchmark runtime expects exactly one top-level callable named forward; move all imports and helper logic inside forward and do not define any other top-level names. "
-                    "Repeat your previous thought in 'thought', and put your thinking for debugging in 'debug_thought'."
-                )})
+                msg_list.append({
+                    "role": "user",
+                    "content": (
+                        f"Error during evaluation:\n{error_entry['error_type']}: {error_entry['error_text']}\n\n"
+                        f"Failure history for this generation:\n{error_history_text}{repeated_failure_text}\n\n"
+                        "Carefully consider where you went wrong in your latest implementation. "
+                        "Using insights from the failure history above, try to debug the current code to implement the same thought. "
+                        "If a failure pattern is repeated, explicitly identify the root cause and change strategy instead of repeating the same fix. "
+                        "The benchmark runtime expects exactly one top-level callable named forward; move all imports and helper logic inside forward and do not define any other top-level names. "
+                        "Repeat your previous thought in 'thought', and put your thinking for debugging in 'debug_thought'."
+                    ),
+                })
                 try:
                     next_solution = _get_json_response_with_retries(msg_list, args.model)
                     next_solution = _postprocess_generated_solution(next_solution, args.model)
-                except Exception as e:
+                except Exception as llm_error:
                     print("During LLM generate new solution:")
-                    print(e)
+                    print(llm_error)
                     continue
-                continue
         if not acc_list:
             recent_failure_summaries.append(
-                _summarize_generation_failure(n + 1, next_solution.get("name", "unknown"), error_history)
+                _summarize_generation_failure(generation_idx + 1, next_solution.get("name", "unknown"), error_history)
             )
             recent_failure_summaries = recent_failure_summaries[-MAX_FAILURE_MEMORY:]
-            n -= 1
             continue
 
         if error_history:
             recent_failure_summaries = []
 
-        fitness_str = bootstrap_confidence_interval(acc_list)
-        next_solution['fitness'] = fitness_str
-        next_solution['generation'] = n + 1
+        next_solution['fitness'] = bootstrap_confidence_interval(acc_list)
+        next_solution['generation'] = generation_idx + 1
 
         if 'debug_thought' in next_solution:
             del next_solution['debug_thought']
@@ -417,7 +418,6 @@ def search(args):
             del next_solution['reflection']
         archive.append(next_solution)
 
-        # save results
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, 'w') as json_file:
             json.dump(archive, json_file, indent=4)
@@ -434,33 +434,29 @@ def evaluate(args):
             eval_archive = json.load(json_file)
 
     current_idx = 0
-    while (current_idx < len(archive)):
+    while current_idx < len(archive):
         with open(file_path, 'r') as json_file:
             archive = json.load(json_file)
         if current_idx < len(eval_archive):
             current_idx += 1
             continue
-        sol = archive[current_idx]
-        print(f"current_gen: {sol['generation']}, current_idx: {current_idx}")
+        solution = archive[current_idx]
+        print(f"current_gen: {solution['generation']}, current_idx: {current_idx}")
         current_idx += 1
         try:
-            acc_list = evaluate_forward_fn(args, sol["code"], run_name=sol["name"])
-        except Exception as e:
-            print(e)
+            acc_list = evaluate_forward_fn(args, solution["code"], run_name=solution["name"])
+        except Exception as error:
+            print(error)
             continue
-        fitness_str = bootstrap_confidence_interval(acc_list)
-        sol['test_fitness'] = fitness_str
-        eval_archive.append(sol)
+        solution['test_fitness'] = bootstrap_confidence_interval(acc_list)
+        eval_archive.append(solution)
 
-        # save results
         os.makedirs(os.path.dirname(eval_file_path), exist_ok=True)
         with open(eval_file_path, 'w') as json_file:
             json.dump(eval_archive, json_file, indent=4)
 
 
 def evaluate_forward_fn(args, forward_str, run_name="archive"):
-    # dynamically define forward()
-    # modified from https://github.com/luchris429/DiscoPOP/blob/main/scripts/launch_evo.py
     namespace = {}
     exec(forward_str, globals(), namespace)
     names = list(namespace.keys())
@@ -471,36 +467,36 @@ def evaluate_forward_fn(args, forward_str, run_name="archive"):
         raise AssertionError(f"{func} is not callable")
     setattr(AgentSystem, "forward", func)
 
-    LETTER_TO_INDEX = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
-    # set seed 0 for valid set
-    df = pandas.read_csv(args.data_filename)
+    examples = get_all_examples(args.data_filename)
     random.seed(args.shuffle_seed)
-    examples = [row.to_dict() for _, row in df.iterrows()]
     random.shuffle(examples)
+
+    required_size = args.valid_size if SEARCHING_MODE else args.valid_size + args.test_size
+    if required_size > len(examples):
+        raise ValueError(
+            f"Requested {required_size} GSM-Hard examples but only {len(examples)} are available in {args.data_filename}."
+        )
 
     if SEARCHING_MODE:
         base_examples = examples[:args.valid_size]
     else:
         base_examples = examples[args.valid_size:args.valid_size + args.test_size]
 
-    examples = []
+    repeated_examples = []
     attempt_indices = []
     for attempt_index in range(1, args.n_repreat + 1):
-        examples.extend(base_examples)
+        repeated_examples.extend(base_examples)
         attempt_indices.extend([attempt_index] * len(base_examples))
 
-    questions = [format_multichoice_question(example) for example in examples]
-    answers = [LETTER_TO_INDEX[example['Answer']] for example in examples]
+    questions = [example['inputs'] for example in repeated_examples]
+    answers = [example['targets'] for example in repeated_examples]
 
-    print(f"problem length: {len(examples)}")
-    max_workers = min(len(examples), args.max_workers) if args.multiprocessing else 1
+    print(f"problem length: {len(repeated_examples)}")
+    max_workers = min(len(repeated_examples), args.max_workers) if args.multiprocessing else 1
 
-    task_queue = []
-    for q in questions:
-        taskInfo = Info('task', 'User', q, -1)
-        task_queue.append(taskInfo)
+    task_queue = [Info('task', 'User', question, -1) for question in questions]
 
-    agentSystem = AgentSystem()
+    agent_system = AgentSystem()
     attempt_rows = {attempt_index: [] for attempt_index in range(1, args.n_repreat + 1)}
     attempt_scores = {attempt_index: [] for attempt_index in range(1, args.n_repreat + 1)}
 
@@ -509,7 +505,7 @@ def evaluate_forward_fn(args, forward_str, run_name="archive"):
     def call_forward(task_info):
         start_query_logging()
         try:
-            result = agentSystem.forward(task_info)
+            result = agent_system.forward(task_info)
             return result, finish_query_logging()
         except Exception:
             execution_logs = finish_query_logging()
@@ -518,61 +514,24 @@ def evaluate_forward_fn(args, forward_str, run_name="archive"):
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(tqdm(executor.map(call_forward, task_queue), total=len(task_queue)))
 
-    for q_idx, (res, execution_logs) in enumerate(results):
-        attempt_index = attempt_indices[q_idx]
-        score = 0
-        parse_error = None
+    for question_idx, (result, execution_logs) in enumerate(results):
+        attempt_index = attempt_indices[question_idx]
         try:
-            if isinstance(res, str) and res in LETTER_TO_INDEX:
-                predicted_idx = LETTER_TO_INDEX[res]
-            elif 'A)' in res:
-                predicted_idx = 0
-            elif 'B)' in res:
-                predicted_idx = 1
-            elif 'C)' in res:
-                predicted_idx = 2
-            elif 'D)' in res:
-                predicted_idx = 3
-            elif isinstance(res, list):
-                try_res = res[1]
-                predicted_idx = LETTER_TO_INDEX[try_res.content]
-            elif res.content in LETTER_TO_INDEX:
-                predicted_idx = LETTER_TO_INDEX[res.content]
-            elif 'A)' in res.content:
-                predicted_idx = 0
-            elif 'B)' in res.content:
-                predicted_idx = 1
-            elif 'C)' in res.content:
-                predicted_idx = 2
-            elif 'D)' in res.content:
-                predicted_idx = 3
-            else:
-                print(f"error in q {q_idx}")
-                parse_error = "Could not map output to a valid MMLU answer choice."
-                predicted_idx = None
-        except Exception as e:
-            parse_error = str(e)
-            predicted_idx = None
+            extracted_answer = result.content if isinstance(result, Info) else result
+            correct_answer = answers[question_idx]
+            correct = score_gsmhard(correct_answer, extracted_answer)
+        except Exception:
+            correct = False
+            extracted_answer = result
 
-        logged_output = res
-        if predicted_idx is None:
-            logged_output = {
-                "parser_status": "unrecognized_answer",
-                "raw_result": res,
-                "parse_error": parse_error,
-            }
-
-        if predicted_idx is not None and predicted_idx == answers[q_idx]:
-            score = 1
-        elif predicted_idx is not None:
-            score = 0
+        score = 1 if correct else 0
         acc_list.append(score)
         attempt_scores[attempt_index].append(score)
         attempt_rows[attempt_index].append({
-            "task": task_queue[q_idx].content,
+            "task": task_queue[question_idx].content,
             "code": forward_str,
-            "output": to_json_text(logged_output),
-            "expected_output": to_json_text(["A", "B", "C", "D"][answers[q_idx]]),
+            "output": to_json_text(extracted_answer),
+            "expected_output": to_json_text(answers[question_idx]),
             "score": score,
             "execution_logs": to_json_text(execution_logs),
         })
@@ -583,7 +542,7 @@ def evaluate_forward_fn(args, forward_str, run_name="archive"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_filename', type=str, default="dataset/mmlu.csv")
+    parser.add_argument('--data_filename', type=str, default='dataset/gsmhardv2.jsonl')
     parser.add_argument('--valid_size', type=int, default=128)
     parser.add_argument('--test_size', type=int, default=800)
     parser.add_argument('--shuffle_seed', type=int, default=0)
@@ -592,20 +551,16 @@ if __name__ == "__main__":
     parser.add_argument('--max_workers', type=int, default=48)
     parser.add_argument('--debug', action='store_true', default=True)
     parser.add_argument('--save_dir', type=str, default='results/')
-    parser.add_argument('--expr_name', type=str, default="mmlu_gpt3.5_results")
+    parser.add_argument('--expr_name', type=str, default='gsmhard_gpt3.5_results')
     parser.add_argument('--n_generation', type=int, default=30)
     parser.add_argument('--debug_max', type=int, default=3)
     parser.add_argument('--skip_evaluate', action='store_true', default=False)
-    parser.add_argument('--model',
-                        type=str,
-                        default=get_default_model())
+    parser.add_argument('--model', type=str, default=get_default_model())
 
     args = parser.parse_args()
-    # search
     SEARCHING_MODE = True
     search(args)
 
-    # evaluate
     if not args.skip_evaluate:
         SEARCHING_MODE = False
         evaluate(args)
